@@ -10,14 +10,15 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/multiformats/go-multiaddr-net"
+	"github.com/vishvananda/netlink"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 type Peer struct {
-	PublicKey	wgtypes.Key
-	PeerID		peer.ID
-	Port		int
-	Addr		net.IP
+	PublicKey	wgtypes.Key		`json:"key"`
+	PeerID		peer.ID			`json:"peer"`
+	Port		int				`json:"port"`
+	Addr		net.IP			`json:"addr"`
 }
 
 func resolvePeerFromAddr(addr net.IP, d *dht.IpfsDHT, k [KeySize]byte) (Peer, error) {
@@ -120,11 +121,7 @@ func (p Peer) toWireguardPeerConfig(d *dht.IpfsDHT) (wgtypes.PeerConfig, error) 
 		Endpoint: endpoint,
 		PersistentKeepaliveInterval: &keepalive,
 		AllowedIPs: []net.IPNet{
-			net.IPNet{
-				IP: p.Addr,
-				// TODO: IPv6 support
-				Mask: net.CIDRMask(32, 32),
-			},
+			*netlink.NewIPNet(p.Addr),
 		},
 	}, nil
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"net"
 
@@ -9,20 +8,20 @@ import (
 )
 
 const (
-	WireguardPrefix	= "ip4"
+	MeshKitPrefix	= "ip4"
 )
 
-type WireguardValidator struct{
+type MeshKitValidator struct{
 	Key [KeySize]byte
 }
 
-func (wg WireguardValidator) Validate(key string, value []byte) error {
+func (wg MeshKitValidator) Validate(key string, value []byte) error {
 	ns, key, err := record.SplitKey(key)
 	if err != nil {
 		return err
 	}
-	if ns != WireguardPrefix {
-		return fmt.Errorf("'%s' namespace expected; got '%s'", WireguardPrefix, ns)
+	if ns != MeshKitPrefix {
+		return fmt.Errorf("'%s' namespace expected; got '%s'", MeshKitPrefix, ns)
 	}
 
 	keyAddr := net.ParseIP(key)
@@ -32,7 +31,7 @@ func (wg WireguardValidator) Validate(key string, value []byte) error {
 
 	var v Peer
 	if err := unbox(value, wg.Key, &v); err != nil {
-		return errors.New("Expected object <Peer>")
+		return err
 	}
 
 	if !keyAddr.Equal(v.Addr) {
@@ -42,6 +41,6 @@ func (wg WireguardValidator) Validate(key string, value []byte) error {
 	return nil
 }
 
-func (wg WireguardValidator) Select(k string, vals [][]byte) (int, error) {
+func (wg MeshKitValidator) Select(k string, vals [][]byte) (int, error) {
 	return 0, nil
 }

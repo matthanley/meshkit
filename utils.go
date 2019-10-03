@@ -16,7 +16,8 @@ import (
 )
 
 const (
-	NonceLength = 24
+	KeySize			= 32
+	NonceLength		= 24
 )
 
 func box(c interface{}, k [KeySize]byte) ([]byte, error) {
@@ -50,7 +51,7 @@ func unbox(b []byte, k [KeySize]byte, c interface{}) error {
 }
 
 func addrToDHTKey(a net.IP) string {
-	return fmt.Sprintf("/%s/%s", WireguardPrefix, a.String())
+	return fmt.Sprintf("/%s/%s", MeshKitPrefix, a.String())
 }
 
 func toBase64(b []byte) string {

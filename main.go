@@ -20,15 +20,63 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/crypto/ed25519"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 const (
 	DefaultPort		= 0xCAFE // 51966
+	IFName			= "meshk0"
 	Keepalive		= time.Hour
-	KeySize			= 32
 )
+
+func ConfigureLocalDevice(a *net.IPNet, p *int, k *wgtypes.Key) error {
+	// Config wg device
+	wgClient := NewWireGuard()
+	defer wgClient.Client.Close()
+
+	if err := wgClient.CreateDevice(
+		IFName, a,
+		wgtypes.Config{
+			PrivateKey: k,
+			ListenPort: p,
+		},
+	); err != nil {
+		return err
+	}
+
+	log.WithFields(log.Fields{
+		"if": IFName,
+		"addr": a.String(),
+		"pubkey": k.PublicKey().String(),
+	}).Info("Configured local overlay endpoint")
+
+	return nil
+}
+
+func CreatePeerFromDHT(a net.IP, d *dht.IpfsDHT, k [KeySize]byte) error {
+	peer, err := resolvePeerFromAddr(a, d, k)
+	if err != nil {
+		return err
+	}
+	wgPeer, err := peer.toWireguardPeerConfig(d)
+	if err != nil {
+		return err
+	}
+
+	log.WithFields(log.Fields{
+		"PublicKey": wgPeer.PublicKey,
+		"Endpoint": wgPeer.Endpoint,
+		"PersistentKeepaliveInterval": wgPeer.PersistentKeepaliveInterval,
+		"AllowedIPs": wgPeer.AllowedIPs,
+	}).Info("Resolved WireGuard peer config")
+
+	wgClient := NewWireGuard()
+	defer wgClient.Client.Close()
+
+	return wgClient.AddPeer(IFName, wgPeer)
+}
 
 func main() {
 	debug := flag.Bool("debug", false,
@@ -73,6 +121,7 @@ func main() {
 		warnOnErr(err)
 	}
 
+	// TODO: load key from token if exists
 	// loadedKey, _ := crypto.ConfigDecodeKey("Sju02mQ8GJDcd1sxpW5D0Ru7fia+RF5pZw2b1ubWtDg=")
 	// copy(meshKey[:], loadedKey)
 
@@ -100,32 +149,35 @@ func main() {
 
 	log.WithFields(log.Fields{
 		"token": joinToken(host),
-	}).Info("Join token")
+	}).Info(">>> Join token <<<")
 
-	// TODO: Config wg device
+	// Create WireGuard interface
+	meshAddr, err := netlink.ParseIPNet(*overlayAddress)
+	panicOnErr(err)
 
-	log.WithFields(log.Fields{
-		"addr": *overlayAddress,
-		"pubkey": wgKey.PublicKey().String(),
-	}).Info("Configured local overlay endpoint")
+	panicOnErr(ConfigureLocalDevice(meshAddr, listenPort, &wgKey))
+
+	// Tidy up after ourselves
+	defer func () {
+		warnOnErr(DestroyDevice(IFName))
+		log.Info(">>> Shutting down.")
+	}()
 
 	// init DHT
 	data, err := dht.New(
 		context.Background(),
 		host,
 		opts.NamespacedValidator(
-			WireguardPrefix,
-			WireguardValidator{
+			MeshKitPrefix,
+			MeshKitValidator{
 				Key: meshKey,
 			},
 		),
 	)
-	panicOnErr(err)
 	defer data.Close()
+	panicOnErr(err)
 
-	if err = data.Bootstrap(data.Context()); err != nil {
-		panicOnErr(err)
-	}
+	panicOnErr(data.Bootstrap(data.Context()))
 
 	host.Network().SetConnHandler(
 		func (conn network.Conn) {
@@ -135,26 +187,6 @@ func main() {
 			}).Info("Peer connected")
 		},
 	)
-
-	tmpAddr := "172.16.0.1"
-
-	if *overlayAddress != tmpAddr {
-		go func() {
-			for range time.Tick(time.Second * 10) {
-				peer, err := resolvePeerFromAddr(net.ParseIP(tmpAddr), data, meshKey)
-				if err != nil {
-					warnOnErr(err)
-					continue
-				}
-				wgPeer, err := peer.toWireguardPeerConfig(data)
-				if err != nil {
-					warnOnErr(err)
-					continue
-				}
-				// log.Info(wgPeer)
-			}
-		}()
-	}
 
 	// Bootstrap from other peer
 	if *token != "" {
@@ -176,23 +208,29 @@ func main() {
 		PublicKey: wgKey.PublicKey(),
 		PeerID: host.ID(),
 		Port: *listenPort,
-		Addr: net.ParseIP(*overlayAddress),
+		Addr: meshAddr.IP,
 	}.advertise(data, meshKey))
 
+	netlinkSub, err := NewNetlinkSubscription()
+	panicOnErr(err)
 
+	// Set handler for RTM_GETNEIGH
+	netlinkSub.L3Miss = func (n netlink.Neigh) error {
+		return CreatePeerFromDHT(n.IP, data, meshKey)
+	}
 
 	// Run indefinitely
 	select {}
 }
 
 // TODO
+// - Include meshKey in joinToken
 // - NETLINK listener
-// - Create wg connections
+// 		Fix required for WireGuard interfaces :(
 // - Remove stale connections
 // 		detect packet loss/unreachable from netlink?
 // 		connection timeout? (latest handshake > keepalive)
 // - Persist config/DHT state
-// - Encrypt control traffic
-// - Peer authentication
+// 		leveldb?
 // - IPAM (raft?)
 // - Infer advertiseAddress if nInterfaces == 1
