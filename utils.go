@@ -11,6 +11,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/host"
 	"golang.org/x/crypto/nacl/secretbox"
 )
@@ -62,12 +63,14 @@ func stringToBase64(s string) string {
 	return toBase64([]byte(s))
 }
 
-func joinToken(h host.Host) string {
+func joinToken(h host.Host, k [KeySize]byte) string {
 	addrs := h.Addrs()
 	return stringToBase64(fmt.Sprintf(
-		"%s/p2p/%s",
+		"%s/p2p/%s%s%s",
 		addrs[0],
 		h.ID(),
+		TokenSeparator,
+		crypto.ConfigEncodeKey(k[:]),
 	))
 }
 
@@ -79,6 +82,6 @@ func warnOnErr(err error) {
 
 func panicOnErr(err error) {
 	if err != nil {
-		log.Fatal(err.Error())
+		log.Error(err.Error())
 	}
 }

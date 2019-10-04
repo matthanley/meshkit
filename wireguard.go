@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"net"
-	"os"
 
 	log "github.com/sirupsen/logrus"
 
@@ -18,6 +17,7 @@ type WireGuard struct {
 }
 
 const (
+	DummyLinkType			= "dummy"
 	WireGuardLinkType		= "wireguard"
 )
 
@@ -30,79 +30,82 @@ func NewWireGuard() *WireGuard {
 	}
 }
 
+func RealIFName(n string) string {
+	return fmt.Sprintf("%s.0", n)
+}
+
 func (wg WireGuard) CreateDevice(n string, addr *net.IPNet, c wgtypes.Config) error {
-	attrs := netlink.NewLinkAttrs()
-    attrs.Name = n
+	/*
+		WireGuard doesn't send RTM_GETNEIGH netlink events
+		since it can't use ARP for neighbour discovery.
+		AFAIK there's no way to get missing neighbour
+		events out of WG, so we need a workaround.
 
-	// >>> ip link add wg0 type wireguard
-	if err := netlink.LinkAdd(
-		&netlink.GenericLink{
-			LinkAttrs: attrs,
-			LinkType: WireGuardLinkType,
-		},
-	); err != nil {
-		// If iface already exists, move along
-		if !os.IsExist(err) {
-			return err
-		}
-		log.WithFields(log.Fields{
-			"dev": n,
-		}).Warn("Device already exists; settings may get overridden")
-	}
+		We add a dummy interface with the specified subnet
+		assigned, and add the single /32 IP to the wg iface.
+		Enabling ARP on the dummy interfaces generates the
+		RTM_GETNEIGH events we're looking for, and we just
+		need to tell the routing table to route discovered
+		peers to the wg iface.
+	 */
 
-	// Populate a Link from netlink
-	link, err := netlink.LinkByName(n)
+	// >>> ip link add dummy0 type dummy
+	link, err := CreateDevice(n, DummyLinkType)
 	if err != nil {
 		return err
 	}
 
-	log.WithFields(log.Fields{
-		"dev": link.Attrs().Name,
-		"type": link.Type(),
-	}).Info("Created netlink device")
-
 	// Enable broadcasting of RTM_GETNEIGH messages
-	warnOnErr(sysctl.Set(fmt.Sprintf("net.ipv4.neigh.%s.app_solicit", n), "1"))
+	warnOnErr(sysctl.Set(fmt.Sprintf("net.ipv4.neigh.%s.app_solicit", link.Attrs().Name), "1"))
 	log.Info("Enabled neighbour solicitation")
+
+	// Enable ARP
+	if err := netlink.LinkSetARPOn(link); err != nil {
+		return err
+	}
+
+	// Split addr into component parts
+	// > addr -> 10.0.0.2/24
+	// > ip -> 10.0.0.2
+	// > ipNet -> 10.0.0.0/24
+	ip, ipNet, err := net.ParseCIDR(addr.String())
+	if err != nil {
+		return err
+	}
+
+	// Assign subnet (with *network* address) to dummy iface
+	if err := AssignAddr(link, ipNet); err != nil {
+		return err
+	}
+
+	// Bring up dummy interface
+	if err := LinkEnable(link); err != nil {
+		return err
+	}
+
+	// >>> ip link add wg0 type wireguard
+	link, err = CreateDevice(RealIFName(n), WireGuardLinkType)
+	if err != nil {
+		return err
+	}
 
 	// Configure WireGuard Device
 	// >>> wg set wg0 private-key /etc/wireguard/wg.key listen-port 51820
-	if err := wg.Client.ConfigureDevice(n, c); err != nil {
+	if err := wg.Client.ConfigureDevice(link.Attrs().Name, c); err != nil {
 		return err
 	}
 	log.WithFields(log.Fields{
-		"dev": n,
+		"dev": link.Attrs().Name,
 	}).Info("Applied configuration to device")
 
 	// Configure interface
 	// >>> ip a a 10.0.0.2/24 dev wg0
-	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: addr}); err != nil {
-		if !os.IsExist(err) {
-			log.WithFields(log.Fields{
-				"link": link,
-				"addr": addr,
-			}).Warn("Failed adding address to interface")
-			return err
-		}
-		log.WithFields(log.Fields{
-			"link": link,
-			"addr": addr,
-		}).Warn("Address already exists on device")
-	}
-	log.WithFields(log.Fields{
-		"addr": addr.String(),
-		"dev": n,
-	}).Info("Added IP address to interface")
-
-	// >>> ip link set up wg0
-	if err := netlink.LinkSetUp(link); err != nil {
+	if err := AssignAddr(link, netlink.NewIPNet(ip)); err != nil {
 		return err
 	}
-	log.WithFields(log.Fields{
-		"dev": n,
-	}).Info("Interface UP")
 
-	return nil
+	// >>> ip link set up wg0
+	return LinkEnable(link)
 }
 
 func (wg WireGuard) AddPeer(d string, c wgtypes.PeerConfig) error {

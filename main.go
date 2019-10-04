@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -27,8 +28,9 @@ import (
 
 const (
 	DefaultPort		= 0xCAFE // 51966
-	IFName			= "meshk0"
+	IFName			= "mesh0"
 	Keepalive		= time.Hour
+	TokenSeparator	= "!"
 )
 
 func ConfigureLocalDevice(a *net.IPNet, p *int, k *wgtypes.Key) error {
@@ -75,7 +77,16 @@ func CreatePeerFromDHT(a net.IP, d *dht.IpfsDHT, k [KeySize]byte) error {
 	wgClient := NewWireGuard()
 	defer wgClient.Client.Close()
 
-	return wgClient.AddPeer(IFName, wgPeer)
+	if err := wgClient.AddPeer(RealIFName(IFName), wgPeer); err != nil {
+		return err
+	}
+
+	// Add a route for the peer to our WireGuard iface
+	link, err := netlink.LinkByName(RealIFName(IFName))
+	if err != nil {
+		return err
+	}
+	return RouteAddViaLink(netlink.NewIPNet(peer.Addr), link)
 }
 
 func main() {
@@ -115,20 +126,6 @@ func main() {
 		"pub": wgKey.PublicKey().String(),
 	}).Debug("Generated network keys")
 
-	// Create a mesh-wide key for encrypting DHT entries
-	var meshKey [KeySize]byte
-	if _, err := io.ReadFull(rand.Reader, meshKey[:]); err != nil {
-		warnOnErr(err)
-	}
-
-	// TODO: load key from token if exists
-	// loadedKey, _ := crypto.ConfigDecodeKey("Sju02mQ8GJDcd1sxpW5D0Ru7fia+RF5pZw2b1ubWtDg=")
-	// copy(meshKey[:], loadedKey)
-
-	log.WithFields(log.Fields{
-		"key": crypto.ConfigEncodeKey(meshKey[:]),
-	}).Info("Generated shared mesh key")
-
 	host, err := libp2p.New(
 		context.Background(),
 		// TODO: infer ip{4,6}
@@ -142,13 +139,55 @@ func main() {
 	panicOnErr(err)
 	defer host.Close()
 
+	host.Network().SetConnHandler(
+		func (conn network.Conn) {
+			log.WithFields(log.Fields{
+				"peer": conn.RemotePeer().String(),
+				"addr": conn.RemoteMultiaddr().String(),
+			}).Info("Peer connected")
+		},
+	)
+
 	log.WithFields(log.Fields{
 		"host": host.ID(),
 		"maddrs": host.Addrs(),
 	}).Info("Host created")
 
+	// Mesh-wide key for encrypting DHT entries
+	var meshKey [KeySize]byte
+
+	var bootstrapPeer *peer.AddrInfo
+
+	if *token != "" {
+		tokenString, err := base64.StdEncoding.DecodeString(*token)
+		panicOnErr(err)
+
+		// Unpack tokenString
+		decodedToken := strings.Split(string(tokenString), TokenSeparator)
+
+		peerAddr, err := multiaddr.NewMultiaddr(decodedToken[0])
+		panicOnErr(err)
+
+		addrInfo, err := peer.AddrInfoFromP2pAddr(peerAddr)
+		panicOnErr(err)
+		bootstrapPeer = addrInfo
+
+		// Load key from token
+		loadedKey, err := crypto.ConfigDecodeKey(decodedToken[1])
+		panicOnErr(err)
+		copy(meshKey[:], loadedKey)
+	} else {
+		// Create a new key
+		if _, err := io.ReadFull(rand.Reader, meshKey[:]); err != nil {
+			warnOnErr(err)
+		}
+		log.WithFields(log.Fields{
+			"key": crypto.ConfigEncodeKey(meshKey[:]),
+		}).Info("Generated shared mesh key")
+	}
+
 	log.WithFields(log.Fields{
-		"token": joinToken(host),
+		"token": joinToken(host, meshKey),
 	}).Info(">>> Join token <<<")
 
 	// Create WireGuard interface
@@ -160,6 +199,7 @@ func main() {
 	// Tidy up after ourselves
 	defer func () {
 		warnOnErr(DestroyDevice(IFName))
+		warnOnErr(DestroyDevice(RealIFName(IFName)))
 		log.Info(">>> Shutting down.")
 	}()
 
@@ -179,27 +219,9 @@ func main() {
 
 	panicOnErr(data.Bootstrap(data.Context()))
 
-	host.Network().SetConnHandler(
-		func (conn network.Conn) {
-			log.WithFields(log.Fields{
-				"peer": conn.RemotePeer().String(),
-				"addr": conn.RemoteMultiaddr().String(),
-			}).Info("Peer connected")
-		},
-	)
-
 	// Bootstrap from other peer
-	if *token != "" {
-		decodedToken, err := base64.StdEncoding.DecodeString(*token)
-		panicOnErr(err)
-
-		peerAddr, err := multiaddr.NewMultiaddr(string(decodedToken))
-		panicOnErr(err)
-
-		addrInfo, err := peer.AddrInfoFromP2pAddr(peerAddr)
-		panicOnErr(err)
-
-		if err := host.Connect(context.TODO(), *addrInfo); err != nil {
+	if bootstrapPeer != nil {
+		if err := host.Connect(context.TODO(), *bootstrapPeer); err != nil {
 			warnOnErr(err)
 		}
 	}
@@ -211,22 +233,23 @@ func main() {
 		Addr: meshAddr.IP,
 	}.advertise(data, meshKey))
 
-	netlinkSub, err := NewNetlinkSubscription()
-	panicOnErr(err)
-
 	// Set handler for RTM_GETNEIGH
-	netlinkSub.L3Miss = func (n netlink.Neigh) error {
-		return CreatePeerFromDHT(n.IP, data, meshKey)
-	}
+	_, err = NewNetlinkSubscription(
+		func (n netlink.Neigh) error {
+			log.WithFields(log.Fields{
+				"addr": n.IP.String(),
+			}).Info("Received L3Miss from netlink")
+			return CreatePeerFromDHT(n.IP, data, meshKey)
+		},
+	)
+	panicOnErr(err)
 
 	// Run indefinitely
 	select {}
 }
 
 // TODO
-// - Include meshKey in joinToken
-// - NETLINK listener
-// 		Fix required for WireGuard interfaces :(
+// ! RPC for remote side to add our public key/peer info
 // - Remove stale connections
 // 		detect packet loss/unreachable from netlink?
 // 		connection timeout? (latest handshake > keepalive)
