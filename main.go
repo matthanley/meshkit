@@ -57,12 +57,12 @@ func ConfigureLocalDevice(a *net.IPNet, p *int, k *wgtypes.Key) error {
 	return nil
 }
 
-func CreatePeerFromDHT(a net.IP, d *dht.IpfsDHT, k [KeySize]byte) error {
-	peer, err := resolvePeerFromAddr(a, d, k)
+func CreatePeerFromDHT(o interface{}, d *dht.IpfsDHT, k [KeySize]byte) error {
+	p, err := resolvePeer(o, d, k)
 	if err != nil {
 		return err
 	}
-	wgPeer, err := peer.toWireguardPeerConfig(d)
+	wgPeer, err := p.toWireguardPeerConfig(d)
 	if err != nil {
 		return err
 	}
@@ -86,7 +86,7 @@ func CreatePeerFromDHT(a net.IP, d *dht.IpfsDHT, k [KeySize]byte) error {
 	if err != nil {
 		return err
 	}
-	return RouteAddViaLink(netlink.NewIPNet(peer.Addr), link)
+	return RouteAddViaLink(netlink.NewIPNet(p.Addr), link)
 }
 
 func main() {
@@ -104,6 +104,7 @@ func main() {
 
 	if *debug {
 		log.SetLevel(log.DebugLevel)
+		// log.SetReportCaller(true)
 	}
 
 	// Creates a new Ed25519 key pair for this host.
@@ -117,15 +118,6 @@ func main() {
 		"key": crypto.ConfigEncodeKey(private),
 	}).Debug("Generated DHT keys")
 
-	// Create Wireguard Keys
-	wgKey, err := wgtypes.GeneratePrivateKey()
-	panicOnErr(err)
-
-	log.WithFields(log.Fields{
-		"key": wgKey.String(),
-		"pub": wgKey.PublicKey().String(),
-	}).Debug("Generated network keys")
-
 	host, err := libp2p.New(
 		context.Background(),
 		// TODO: infer ip{4,6}
@@ -138,15 +130,6 @@ func main() {
 	)
 	panicOnErr(err)
 	defer host.Close()
-
-	host.Network().SetConnHandler(
-		func (conn network.Conn) {
-			log.WithFields(log.Fields{
-				"peer": conn.RemotePeer().String(),
-				"addr": conn.RemoteMultiaddr().String(),
-			}).Info("Peer connected")
-		},
-	)
 
 	log.WithFields(log.Fields{
 		"host": host.ID(),
@@ -186,23 +169,6 @@ func main() {
 		}).Info("Generated shared mesh key")
 	}
 
-	log.WithFields(log.Fields{
-		"token": joinToken(host, meshKey),
-	}).Info(">>> Join token <<<")
-
-	// Create WireGuard interface
-	meshAddr, err := netlink.ParseIPNet(*overlayAddress)
-	panicOnErr(err)
-
-	panicOnErr(ConfigureLocalDevice(meshAddr, listenPort, &wgKey))
-
-	// Tidy up after ourselves
-	defer func () {
-		warnOnErr(DestroyDevice(IFName))
-		warnOnErr(DestroyDevice(RealIFName(IFName)))
-		log.Info(">>> Shutting down.")
-	}()
-
 	// init DHT
 	data, err := dht.New(
 		context.Background(),
@@ -217,13 +183,55 @@ func main() {
 	defer data.Close()
 	panicOnErr(err)
 
-	panicOnErr(data.Bootstrap(data.Context()))
+	// Create Wireguard Keys
+	wgKey, err := wgtypes.GeneratePrivateKey()
+	panicOnErr(err)
+
+	log.WithFields(log.Fields{
+		"key": wgKey.String(),
+		"pub": wgKey.PublicKey().String(),
+	}).Debug("Generated network keys")
+
+	// Create WireGuard interface
+	meshAddr, err := netlink.ParseIPNet(*overlayAddress)
+	panicOnErr(err)
+
+	panicOnErr(ConfigureLocalDevice(meshAddr, listenPort, &wgKey))
+
+	// Tidy up after ourselves
+	defer func () {
+		warnOnErr(DestroyDevice(IFName))
+		warnOnErr(DestroyDevice(RealIFName(IFName)))
+		log.Info(">>> Shutting down.")
+	}()
+
+	host.Network().SetConnHandler(
+		func (conn network.Conn) {
+			log.WithFields(log.Fields{
+				"peer": conn.RemotePeer().String(),
+				"addr": conn.RemoteMultiaddr().String(),
+			}).Info("Peer connected")
+
+			warnOnErr(CreatePeerFromDHT(conn.RemotePeer(), data, meshKey))
+		},
+	)
 
 	// Bootstrap from other peer
 	if bootstrapPeer != nil {
 		if err := host.Connect(context.TODO(), *bootstrapPeer); err != nil {
 			warnOnErr(err)
 		}
+	}
+
+	// Bootstrap complete
+	log.WithFields(log.Fields{
+		"token": joinToken(host, meshKey),
+	}).Info(">>> Join token <<<")
+
+	// Only advertise when we have peers available
+	log.Info("Waiting for peers")
+	for data.RoutingTable().Size() == 0 {
+		time.Sleep(time.Second)
 	}
 
 	warnOnErr(Peer{
@@ -234,7 +242,11 @@ func main() {
 	}.advertise(data, meshKey))
 
 	// Set handler for RTM_GETNEIGH
+	link, err := netlink.LinkByName(IFName)
+	panicOnErr(err)
+
 	_, err = NewNetlinkSubscription(
+		link,
 		func (n netlink.Neigh) error {
 			log.WithFields(log.Fields{
 				"addr": n.IP.String(),
@@ -249,11 +261,10 @@ func main() {
 }
 
 // TODO
-// ! RPC for remote side to add our public key/peer info
+// - Infer advertiseAddress if nInterfaces == 1
 // - Remove stale connections
 // 		detect packet loss/unreachable from netlink?
 // 		connection timeout? (latest handshake > keepalive)
 // - Persist config/DHT state
 // 		leveldb?
 // - IPAM (raft?)
-// - Infer advertiseAddress if nInterfaces == 1

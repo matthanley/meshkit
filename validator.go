@@ -4,11 +4,15 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-record"
 )
 
+// TODO:
+// Split validator into peer and ip{4,6} validators
+
 const (
-	MeshKitPrefix	= "ip4"
+	MeshKitPrefix	= "peer"
 )
 
 type MeshKitValidator struct{
@@ -24,9 +28,15 @@ func (wg MeshKitValidator) Validate(key string, value []byte) error {
 		return fmt.Errorf("'%s' namespace expected; got '%s'", MeshKitPrefix, ns)
 	}
 
+	// Check for an IP address in the key
+	var keyID peer.ID
 	keyAddr := net.ParseIP(key)
 	if keyAddr == nil {
-		return fmt.Errorf("IP address expected; got '%s'", key)
+		// We don't have an IP address; check for a peer ID instead
+		keyID, err = peer.IDB58Decode(key)
+		if (err != nil) {
+			return fmt.Errorf("IP address or Peer ID expected; got '%s'", key)
+		}
 	}
 
 	var v Peer
@@ -34,8 +44,13 @@ func (wg MeshKitValidator) Validate(key string, value []byte) error {
 		return err
 	}
 
-	if !keyAddr.Equal(v.Addr) {
-		return fmt.Errorf("Key '%s' does not match payload Addr '%s'", key, v.Addr.String())
+	// by this point one of {keyAddr, keyID} is non-nil
+	if keyAddr != nil {
+		if !keyAddr.Equal(v.Addr) {
+			return fmt.Errorf("Key '%s' does not match payload Addr '%s'", key, v.Addr.String())
+		}
+	} else if keyID != v.PeerID {
+		return fmt.Errorf("Key '%s' does not match peer ID '%s'", key, v.PeerID.String())
 	}
 
 	return nil

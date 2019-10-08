@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 
@@ -21,21 +22,56 @@ type Peer struct {
 	Addr		net.IP			`json:"addr"`
 }
 
-func resolvePeerFromAddr(addr net.IP, d *dht.IpfsDHT, k [KeySize]byte) (Peer, error) {
-	result, err := d.GetValue(
-		context.TODO(),
-		addrToDHTKey(addr),
-	)
-	if err != nil {
-		return Peer{}, err
+func resolvePeer(o interface{}, d *dht.IpfsDHT, k [KeySize]byte) (Peer, error) {
+	var key string
+	switch a := o.(type) {
+	case net.IP:
+		key = addrToDHTKey(a)
+	case peer.ID:
+		key = peerToDHTKey(a)
+	default:
+		return Peer{}, fmt.Errorf("Unknown peer reference")
 	}
+
+	log.WithFields(log.Fields{
+		"key": key,
+	}).Info("DHT lookup")
+
+	// There's potential for a race here if we connect
+	// before the peer entry has been populated in the DHT -
+	// Keep looking for 10 seconds
+	var result []byte
+
+	loop:
+		for timeout := time.After(time.Second*10); ; {
+			select {
+			case <-timeout:
+				return Peer{}, fmt.Errorf("Deadline exceeded")
+			default:
+				var err error
+				if result, err = d.GetValue(
+					context.TODO(),
+					key,
+				); err != nil {
+					// If it doesn't exist, keep looking until
+					// timeout
+					log.WithFields(log.Fields{
+						"key": key,
+					}).Debug("Not found; keep trying")
+					break // break select
+				}
+				// Found peer - stop looking
+				break loop // break for loop
+			}
+			time.Sleep(time.Second)
+		}
 
 	var p Peer
 	if err := unbox(result, k, &p); err != nil {
 		return Peer{}, err
 	}
 	log.WithFields(log.Fields{
-		"key": addrToDHTKey(p.Addr),
+		"key": key,
 		"PublicKey": p.PublicKey.String(),
 		"PeerID": p.PeerID.String(),
 		"Port": p.Port,
@@ -53,7 +89,24 @@ func (p Peer) advertise(d *dht.IpfsDHT, k [KeySize]byte) error {
 
 	log.WithFields(log.Fields{
 		"addr": p.Addr.String(),
+		"id": p.PeerID.String(),
 	}).Info("Advertising overlay address")
+
+	/*
+		Peers need to be resolvable by both IP address and
+		Peer ID, so we create the same entry with two keys
+	 */
+
+	// PutValue with PeerID as key
+	if err := d.PutValue(
+		context.TODO(),
+		peerToDHTKey(p.PeerID),
+		payload,
+	); err != nil {
+		return err
+	}
+
+	// PutValue with IP as key
 	return d.PutValue(
 		context.TODO(),
 		addrToDHTKey(p.Addr),

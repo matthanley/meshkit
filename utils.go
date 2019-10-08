@@ -13,6 +13,7 @@ import (
 
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
 	"golang.org/x/crypto/nacl/secretbox"
 )
 
@@ -39,7 +40,7 @@ func box(c interface{}, k [KeySize]byte) ([]byte, error) {
 func unbox(b []byte, k [KeySize]byte, c interface{}) error {
 	log.WithFields(log.Fields{
 		"payload": toBase64(b[:]),
-	}).Info("Unboxing payload")
+	}).Debug("Unboxing payload")
 	// Extract nonce from payload
 	var nonce [NonceLength]byte
 	copy(nonce[:], b[:NonceLength])
@@ -53,6 +54,10 @@ func unbox(b []byte, k [KeySize]byte, c interface{}) error {
 
 func addrToDHTKey(a net.IP) string {
 	return fmt.Sprintf("/%s/%s", MeshKitPrefix, a.String())
+}
+
+func peerToDHTKey(p peer.ID) string {
+	return fmt.Sprintf("/%s/%s", MeshKitPrefix, p.String())
 }
 
 func toBase64(b []byte) string {

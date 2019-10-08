@@ -14,13 +14,15 @@ type NetlinkSubscription struct {
 	Done		chan struct{}
 	Channel		chan netlink.NeighUpdate
 	L3Miss		func (netlink.Neigh) error
+	Link		netlink.Link
 }
 
-func NewNetlinkSubscription(h func (netlink.Neigh) error) (*NetlinkSubscription, error) {
+func NewNetlinkSubscription(link netlink.Link, h func (netlink.Neigh) error) (*NetlinkSubscription, error) {
 	sub := &NetlinkSubscription{
 		Done: make(chan struct{}),
 		Channel: make(chan netlink.NeighUpdate),
 		L3Miss: h,
+		Link: link,
 	}
 
 	if err := netlink.NeighSubscribe(sub.Channel, sub.Done); err != nil {
@@ -46,11 +48,14 @@ func (s NetlinkSubscription) handle() {
 	defer close(s.Done)
 	for {
 		update := <-s.Channel
-		switch t := update.Type; t {
-		case unix.RTM_GETNEIGH:
-			warnOnErr(s.L3Miss(update.Neigh))
-		default:
-			//
+		// Only listen for our interface
+		if update.Neigh.LinkIndex == s.Link.Attrs().Index {
+			switch t := update.Type; t {
+			case unix.RTM_GETNEIGH:
+				warnOnErr(s.L3Miss(update.Neigh))
+			default:
+				//
+			}
 		}
 	}
 }
@@ -92,8 +97,13 @@ func RouteAddViaLink(r *net.IPNet, link netlink.Link) error {
 		Dst: r,
 		LinkIndex: link.Attrs().Index,
 	}
-
-	return netlink.RouteAdd(route)
+	if err := netlink.RouteAdd(route); err != nil {
+		// Ignore if route already exists
+		if !os.IsExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func CreateDevice(n string, t string) (netlink.Link, error) {
