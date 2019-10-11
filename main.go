@@ -19,6 +19,7 @@ import (
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/peerstore"
 	"github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/vishvananda/netlink"
@@ -104,7 +105,6 @@ func main() {
 
 	if *debug {
 		log.SetLevel(log.DebugLevel)
-		// log.SetReportCaller(true)
 	}
 
 	// Creates a new Ed25519 key pair for this host.
@@ -123,7 +123,7 @@ func main() {
 		// TODO: infer ip{4,6}
 		libp2p.ListenAddrStrings(fmt.Sprintf(
 			"/ip4/%s/tcp/%d",
-			*advertiseAddress,
+			*advertiseAddress, // 0.0.0.0?
 			*listenPort,
 		)),
 		libp2p.Identity(dhtKey),
@@ -207,20 +207,47 @@ func main() {
 
 	host.Network().SetConnHandler(
 		func (conn network.Conn) {
-			log.WithFields(log.Fields{
-				"peer": conn.RemotePeer().String(),
-				"addr": conn.RemoteMultiaddr().String(),
-			}).Info("Peer connected")
-
 			warnOnErr(CreatePeerFromDHT(conn.RemotePeer(), data, meshKey))
 		},
 	)
 
+	host.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(n network.Network, c network.Conn) {
+			log.WithFields(log.Fields{
+				"peer": c.RemotePeer().String(),
+				"addr": c.RemoteMultiaddr().String(),
+			}).Info("Peer connected")
+
+			/*
+				There appears to be a bug in libp2p that
+				causes the TTL of entries in the peerstore
+				to expire even while peers are still connected.
+				This corrects that behaviour.
+			 */
+			host.Peerstore().AddAddrs(
+				c.RemotePeer(),
+				[]multiaddr.Multiaddr{c.RemoteMultiaddr()},
+				peerstore.ConnectedAddrTTL,
+			)
+		},
+		DisconnectedF: func(n network.Network, c network.Conn) {
+			log.WithFields(log.Fields{
+				"peer": c.RemotePeer().String(),
+			}).Info("Peer disconnected")
+
+			host.Peerstore().UpdateAddrs(
+				c.RemotePeer(),
+				peerstore.ConnectedAddrTTL,
+				peerstore.RecentlyConnectedAddrTTL,
+			)
+
+			// TODO: Remove the WG peer info
+		},
+	})
+
 	// Bootstrap from other peer
 	if bootstrapPeer != nil {
-		if err := host.Connect(context.TODO(), *bootstrapPeer); err != nil {
-			warnOnErr(err)
-		}
+		warnOnErr(host.Connect(context.TODO(), *bootstrapPeer))
 	}
 
 	// Bootstrap complete

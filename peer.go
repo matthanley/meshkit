@@ -116,6 +116,9 @@ func (p Peer) advertise(d *dht.IpfsDHT, k [KeySize]byte) error {
 
 func (p Peer) networkEndpoint(d *dht.IpfsDHT) (*net.UDPAddr, error) {
 	// Locate the Peer on the network
+	log.WithFields(log.Fields{
+		"peer": p.PeerID.String(),
+	}).Info("FindPeer in DHT")
 	addrInfo, err := d.FindPeer(context.TODO(), p.PeerID)
 	if err != nil {
 		return &net.UDPAddr{}, err
@@ -126,10 +129,16 @@ func (p Peer) networkEndpoint(d *dht.IpfsDHT) (*net.UDPAddr, error) {
 		"addrs": addrInfo.Addrs,
 	}).Info("Resolved peer addresses")
 
-	// Block until we successfully connect
+	/*
+		Block until we successfully connect
+	 */
 	d.Host().Connect(context.TODO(), addrInfo)
 
-	// Get active connection multiaddress
+	/*
+		Get an *active* connection multiaddress -
+		should ensure we have a reachable endpoint
+		for the peer.
+	 */
 	activeConns := d.Host().Network().ConnsToPeer(p.PeerID)
 	maddr := activeConns[0].RemoteMultiaddr()
 	log.WithFields(log.Fields{
